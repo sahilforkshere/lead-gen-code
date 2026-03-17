@@ -9,21 +9,15 @@ const PARALLEL_API_KEY   = Deno.env.get("PARALLEL_API_KEY")!;
 const TAVILY_API_KEY     = Deno.env.get("TAVILY_API_KEY")!;
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-// Supabase edge function hard limit: 150s.
-// Budget: Phase1 ~4s | Phase2 ~10s | Phase3 ~1s | Phase4 ~80s | Phase5 ~4s = ~99s
-// DEADLINE_MS forces Phase4 to stop early so Phase5 always runs.
-
-const FINAL_OUTPUT_SIZE  = 100;   // target leads to return
-const EXTRACT_BATCH_SIZE = 10;    // concurrent GPT extractions per batch
-const MAX_DIR_PAGES      = 5;     // max URLs scraped per directory domain
-const MAX_TARGETS        = 30;    // hard cap on URLs to process (dir pages first)
-const SUB_QUERY_COUNT    = 10;    // total search queries (mix of dir + direct)
-const FETCH_TIMEOUT_MS   = 12000; // abort any single external HTTP call after 12s
-const DEADLINE_MS        = 110000; // stop extraction at 110s — leave 40s for DB
+const FINAL_OUTPUT_SIZE  = 100;
+const EXTRACT_BATCH_SIZE = 10;
+const MAX_DIR_PAGES      = 5;   // allow up to 5 URLs from the same directory domain
+const SUB_QUERY_COUNT    = 20;
 
 // ─── DOMAIN LISTS ─────────────────────────────────────────────────────────────
+
 // Directory pages list 10-30 businesses each — highest yield per extraction.
-// We WANT these; GPT will extract every restaurant listed on the page.
+// We WANT these and will extract EVERY business from them.
 const DIRECTORY_DOMAINS = [
   "justdial.com", "sulekha.com", "zomato.com", "swiggy.com",
   "tripadvisor.", "yelp.", "indiamart.com", "tradeindia.com",
@@ -32,22 +26,14 @@ const DIRECTORY_DOMAINS = [
   "yellowpages.", "lbb.in", "whatshot.in",
 ];
 
-// Pure noise — no restaurant contact data here at all.
-const BLOCKED_DOMAINS = [
-  "facebook.", "instagram.", "twitter.", "linkedin.", "pinterest.",
-  "youtube.com", "youtu.be", "tiktok.com", "snapchat.com",
-  "reddit.com", "quora.com", "tumblr.com",
-  "wikipedia.org", "wikimedia.", "britannica.com",
-  "apps.apple.com", "play.google.com",
-  "food.ndtv.com", "ndtv.com", "hindustantimes.com", "timesofindia.",
-  "economictimes.", "thehindu.com", "scroll.in",
-  "timeout.com", "eater.com", "thrillist.com", "zagat.com",
-  "seriouseats.com", "bonappetit.com", "foodandwine.com",
-  "cntraveller.", "cntraveler.", "lonelyplanet.",
+// Pure noise — zero chance of real business contact data.
+const HARD_BLOCKED = [
+  "facebook.com", "instagram.com", "twitter.com", "x.com",
+  "linkedin.com", "youtube.com", "youtu.be", "tiktok.com",
+  "reddit.com", "quora.com", "pinterest.com", "tumblr.com",
+  "wikipedia.org", "wikimedia.org",
   "amazon.com", "amazon.in", "flipkart.com",
-  "booking.com", "makemytrip.com", "airbnb.com",
-  "wordpress.com", "blogspot.com", "medium.com", "substack.com",
-  "wixsite.com", "weebly.com", "squarespace.com",
+  "apps.apple.com", "play.google.com",
 ];
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -57,58 +43,37 @@ function safeHostname(raw: string): string | null {
   catch { return null; }
 }
 
-function isDirectoryDomain(domain: string): boolean {
+function isDirectory(domain: string): boolean {
   return DIRECTORY_DOMAINS.some((d) => domain.includes(d));
 }
 
-function isBlockedDomain(domain: string): boolean {
-  return BLOCKED_DOMAINS.some((b) => domain.includes(b));
+function isBlocked(domain: string): boolean {
+  return HARD_BLOCKED.some((b) => domain.includes(b));
 }
 
-/** Normalise a company name for deduplication (lowercase, strip punctuation). */
+/** Normalise a company name for dedup (lowercase, strip punctuation). */
 function normaliseName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
 }
 
-/** fetch with AbortController — never hangs indefinitely. */
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  ms = FETCH_TIMEOUT_MS,
-): Promise<Response> {
-  const ac    = new AbortController();
-  const timer = setTimeout(() => ac.abort(), ms);
-  try {
-    return await fetch(url, { ...init, signal: ac.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Call GPT-4o-mini and parse a JSON response. Returns null on any error. */
 async function gptJson<T>(
   messages: { role: string; content: string }[],
   label: string,
 ): Promise<T | null> {
   try {
-    const res = await fetchWithTimeout(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method:  "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
-        body: JSON.stringify({
-          model:           "gpt-4o-mini",
-          response_format: { type: "json_object" },
-          messages,
-        }),
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method:  "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
-      22000, // GPT gets a slightly longer budget than raw fetches
-    );
+      body: JSON.stringify({
+        model:           "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages,
+      }),
+    });
     const data = await res.json();
-    if (!data.choices?.[0]?.message?.content) {
-      console.error(`gptJson [${label}] bad response:`, JSON.stringify(data).slice(0, 300));
-      return null;
-    }
     return JSON.parse(data.choices[0].message.content) as T;
   } catch (e) {
     console.error(`gptJson [${label}] failed:`, (e as Error).message);
@@ -118,29 +83,29 @@ async function gptJson<T>(
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 serve(async (req) => {
-  const START_TIME = Date.now();
-  const elapsed    = () => `${((Date.now() - START_TIME) / 1000).toFixed(1)}s`;
-
   console.log("══════════════════════════════════════════════════════════");
-  console.log("🚀 [INVOCATION] Lead-Alert Search Engine Started");
+  console.log("🚀 [INVOCATION] Lead-Alert Pipeline Started");
+
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  let preference_id = "";
 
   try {
     const payload = await req.json();
     const record  = payload.record;
     if (!record) throw new Error("No record in payload.");
 
-    const { id: preference_id, user_id, search_query } = record;
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    const { id: pref_id, user_id, search_query } = record;
+    preference_id = pref_id;
 
     await supabase
       .from("lead_preferences")
-      .update({ status: "processing" })
+      .update({ status: "processing", started_at: new Date().toISOString() })
       .eq("id", preference_id);
 
     // ══════════════════════════════════════════════════════════
     // PHASE 1 — QUERY EXPANSION
-    // Mix of directory queries (yield 10-20 leads/page) and
-    // direct-site queries (1-2 leads/page but richer data).
+    // Mix of directory queries (high yield: 10-20 leads/page)
+    // AND direct/official-site queries (richer data per lead).
     // ══════════════════════════════════════════════════════════
     console.log("🧠 [PHASE 1] Expanding query…");
 
@@ -150,21 +115,27 @@ serve(async (req) => {
         content: `You are a lead-generation expert. Given the search intent below, produce a JSON
 object with key "queries" containing exactly ${SUB_QUERY_COUNT} search strings.
 
-Composition rules (STRICT — follow exactly):
-- 6 queries MUST target directory/listing pages. Use these sites directly:
-  Justdial, Sulekha, Zomato, Magicpin, Tripadvisor, Yelp, Dineout, EazyDiner
-  Example formats:
-    "justdial [type] [city] contact phone"
-    "sulekha [type] [area] list"
-    "zomato [type] [city] restaurants"
-    "tripadvisor restaurants [city] [type]"
-  Each of these pages lists 10-20 businesses — highest lead yield.
+COMPOSITION (follow strictly):
 
-- 4 queries MUST target individual business websites directly:
-  Use specific restaurant names, neighbourhoods, "official site", "phone number", "contact"
-  Example:
-    "Chinese restaurant Connaught Place Delhi official site phone"
-    "South Indian restaurant Bandra Mumbai contact details"
+GROUP A — 10 queries targeting DIRECTORY / LISTING sites (highest lead yield):
+  Use these site names directly in queries:
+  Justdial, Sulekha, Zomato, Magicpin, Tripadvisor, Yelp, Dineout, EazyDiner, Yellow Pages, LBB
+  Format examples:
+    "justdial [business type] [city/area] contact phone"
+    "zomato [business type] [city] restaurants list"
+    "sulekha [business type] [area] [city] list with phone numbers"
+    "tripadvisor [business type] [city] reviews phone"
+  VARY the area/neighbourhood in each query to get DIFFERENT listing pages.
+
+GROUP B — 10 queries targeting OFFICIAL / DIRECT business websites:
+  Use specific neighbourhoods, business names if known, "official site", "contact us",
+  "phone number", "email", "address".
+  Format examples:
+    "[business type] [specific neighbourhood] official website contact"
+    "best [business type] [area] phone number email"
+    "[famous business name] [city] official site"
+  VARY keywords: restaurant, eatery, dining, kitchen, café, bistro, cuisine, dhaba etc.
+  INCLUDE regional language terms if relevant.
 
 Output ONLY the JSON object. No extra keys. No markdown.
 Search intent: "${search_query}"`,
@@ -179,39 +150,39 @@ Search intent: "${search_query}"`,
       [search_query]
     ).slice(0, SUB_QUERY_COUNT);
 
-    console.log(`✨ [PHASE 1] ${subQueries.length} queries (${elapsed()}):`, subQueries);
+    console.log(`✨ [PHASE 1] ${subQueries.length} sub-queries generated.`);
 
     // ══════════════════════════════════════════════════════════
-    // PHASE 2 — DISCOVERY
-    // Both APIs run in parallel across all queries simultaneously.
-    // Every fetch is guarded by FETCH_TIMEOUT_MS.
+    // PHASE 2 — DISCOVERY (Parallel + Tavily in parallel)
     // ══════════════════════════════════════════════════════════
-    console.log("🔍 [PHASE 2] Discovery (Parallel AI + Tavily simultaneously)…");
+    console.log("🔍 [PHASE 2] Running bulk URL discovery…");
 
     const rawResults: { url: string; snippet: string }[] = [];
 
     const [parallelPages, tavilyPages] = await Promise.all([
+      // 2A — Parallel Search
       Promise.all(
         subQueries.map((q) =>
-          fetchWithTimeout("https://api.parallel.ai/v1beta/search", {
+          fetch("https://api.parallel.ai/v1beta/search", {
             method:  "POST",
             headers: { "Content-Type": "application/json", "x-api-key": PARALLEL_API_KEY },
             body: JSON.stringify({
               objective: q, search_queries: [q],
-              mode: "fast", max_results: 20,
-              excerpts: { max_chars_per_result: 2000 },
+              mode: "fast", max_results: 25,
+              excerpts: { max_chars_per_result: 4000 },
             }),
           }).then((r) => r.json()).catch(() => ({ results: [] }))
         )
       ),
+      // 2B — Tavily Search
       Promise.all(
         subQueries.map((q) =>
-          fetchWithTimeout("https://api.tavily.com/search", {
+          fetch("https://api.tavily.com/search", {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               api_key: TAVILY_API_KEY, query: q,
-              search_depth: "basic", max_results: 15,
+              search_depth: "advanced", max_results: 20,
             }),
           }).then((r) => r.json()).catch(() => ({ results: [] }))
         )
@@ -230,22 +201,24 @@ Search intent: "${search_query}"`,
       }
     }
 
-    console.log(`🌐 [PHASE 2 RESULT] ${rawResults.length} raw hits (${elapsed()}).`);
+    console.log(`🌐 [PHASE 2] ${rawResults.length} total raw URLs collected.`);
 
     // ══════════════════════════════════════════════════════════
     // PHASE 3 — FILTER, DEDUP & SORT
     //
-    // Directory pages come first (highest lead yield).
-    // For directories: allow up to MAX_DIR_PAGES per domain so we
-    //   get multiple listing pages from the same site.
-    // For direct sites: one URL per domain only.
-    // Hard cap at MAX_TARGETS total.
+    // KEY LOGIC:
+    //   Directory domains → allow up to MAX_DIR_PAGES different
+    //     URLs from the same domain (each page lists different
+    //     businesses, so justdial.com/page1 ≠ justdial.com/page2).
+    //   Direct domains    → 1 URL per domain (it's one business).
+    //   Directory targets come FIRST (highest yield per GPT call).
     // ══════════════════════════════════════════════════════════
-    console.log("🧹 [PHASE 3] Filtering, deduplicating, sorting…");
+    console.log("🧹 [PHASE 3] Filtering and deduplicating…");
 
     const seenUrls          = new Set<string>();
     const seenDirectDomains = new Set<string>();
     const dirPageCount      = new Map<string, number>();
+
     const dirTargets:    { url: string; domain: string; snippet: string; isDirectory: true  }[] = [];
     const directTargets: { url: string; domain: string; snippet: string; isDirectory: false }[] = [];
 
@@ -255,14 +228,16 @@ Search intent: "${search_query}"`,
 
       const domain = safeHostname(item.url);
       if (!domain) continue;
-      if (isBlockedDomain(domain)) continue;
+      if (isBlocked(domain)) continue;
 
-      if (isDirectoryDomain(domain)) {
+      if (isDirectory(domain)) {
+        // Allow multiple pages from the same directory domain
         const count = dirPageCount.get(domain) ?? 0;
         if (count >= MAX_DIR_PAGES) continue;
         dirPageCount.set(domain, count + 1);
         dirTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: true });
       } else {
+        // Direct sites: one URL per domain
         if (seenDirectDomains.has(domain)) continue;
         seenDirectDomains.add(domain);
         directTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: false });
@@ -270,41 +245,39 @@ Search intent: "${search_query}"`,
     }
 
     // Directory pages first (more leads per call), then direct sites
-    const targets  = [...dirTargets, ...directTargets].slice(0, MAX_TARGETS);
-    const dirCount = targets.filter((t) => t.isDirectory).length;
+    const targets = [...dirTargets, ...directTargets];
+    const dirCount = dirTargets.length;
 
-    console.log(`🎯 [PHASE 3 RESULT] ${targets.length} targets (${dirCount} directory + ${targets.length - dirCount} direct).`);
+    console.log(`🎯 [PHASE 3] ${targets.length} targets (${dirCount} directory pages + ${directTargets.length} direct sites).`);
 
     // ══════════════════════════════════════════════════════════
-    // PHASE 4 — EXTRACTION
+    // PHASE 4 — EXTRACTION & SCORING
     //
-    // Directory pages  → Tavily Extract for full HTML → GPT returns
-    //                    businesses[] array (every restaurant on page).
-    // Direct sites     → snippet only (skip extra HTTP call) → GPT
-    //                    returns single-item businesses[] array.
+    // TWO EXTRACTION MODES:
+    //   Directory pages → GPT returns businesses[] array with
+    //     EVERY business listed on the page. A single Justdial
+    //     page can yield 10-20 leads.
+    //   Direct sites    → GPT returns a single-item businesses[]
+    //     array for that one business.
     //
-    // Deduplication is by normalised company name across ALL sources.
-    // Domain-based dedup alone is wrong — Justdial has hundreds of
-    // different restaurants on different pages.
+    // DEDUP: By normalised company name across ALL sources.
+    //   Domain-based dedup would wrongly merge different
+    //   restaurants from the same directory.
     //
-    // Global deadline guard at DEADLINE_MS ensures Phase 5 always runs.
+    // LENIENT CRITERIA: A lead is kept if it has a company_name.
+    //   Phone/email/address are scored but NOT required.
+    //   This maximises unique lead count.
     // ══════════════════════════════════════════════════════════
     console.log(`⛏️  [PHASE 4] Extracting ${targets.length} targets in batches of ${EXTRACT_BATCH_SIZE}…`);
 
-    // Shared state across batches
     const allLeads: { lead: object; score: number }[] = [];
     const seenNames = new Set<string>(); // dedup by normalised company name
 
-    outer:
     for (let i = 0; i < targets.length; i += EXTRACT_BATCH_SIZE) {
-      if (Date.now() - START_TIME > DEADLINE_MS) {
-        console.warn(`  ⏰ Deadline at ${elapsed()} — stopping extraction.`);
-        break outer;
-      }
-
       const batch    = targets.slice(i, i + EXTRACT_BATCH_SIZE);
       const batchNum = Math.floor(i / EXTRACT_BATCH_SIZE) + 1;
-      console.log(`  Batch ${batchNum}/${Math.ceil(targets.length / EXTRACT_BATCH_SIZE)}: ${batch.length} targets (${elapsed()})…`);
+      const total    = Math.ceil(targets.length / EXTRACT_BATCH_SIZE);
+      console.log(`  Batch ${batchNum}/${total}: ${batch.length} targets…`);
 
       const batchResults = await Promise.all(
         batch.map(async (target) => {
@@ -312,19 +285,17 @@ Search intent: "${search_query}"`,
             // ── 4A: Get page content ─────────────────────────
             let content = target.snippet;
 
-            // Always fetch full content for directory pages (listing data is in full HTML).
-            // For direct sites, only fetch if the snippet is too short.
-            const shouldExtract = target.isDirectory || content.length < 400;
+            // Always fetch full content for directory pages (listing
+            // data is in the full HTML, not the snippet).
+            // For direct sites, only fetch if snippet is too short.
+            const shouldFetch = target.isDirectory || content.length < 400;
 
-            if (shouldExtract) {
-              const scrapeRes = await fetchWithTimeout(
-                "https://api.tavily.com/extract",
-                {
-                  method:  "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ api_key: TAVILY_API_KEY, urls: [target.url] }),
-                },
-              ).catch(() => null);
+            if (shouldFetch) {
+              const scrapeRes = await fetch("https://api.tavily.com/extract", {
+                method:  "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ api_key: TAVILY_API_KEY, urls: [target.url] }),
+              }).catch(() => null);
 
               if (scrapeRes?.ok) {
                 const scrapeData = await scrapeRes.json().catch(() => ({}));
@@ -334,14 +305,14 @@ Search intent: "${search_query}"`,
             }
 
             if (content.length < 80) {
-              console.warn(`    ⚠️  ${target.domain}: content too short, skip.`);
+              console.warn(`    ⚠️  ${target.domain}: content too short, skipping.`);
               return [];
             }
 
             // ── 4B: GPT extraction ───────────────────────────
-            // Always returns { businesses: [] } — even for single-site pages.
-            // This unified shape means directory pages return 15+ entries
-            // and direct sites return exactly 1.
+            // UNIFIED shape: always returns { businesses: [] }
+            // Directory pages → 10-20 entries
+            // Direct sites    → exactly 1 entry
             const extracted = await gptJson<{
               businesses: {
                 company_name: string;
@@ -354,35 +325,39 @@ Search intent: "${search_query}"`,
             }>(
               [
                 {
-                  role:    "system",
-                  content: `You are a restaurant lead extractor. Extract contact details for EVERY restaurant mentioned on this page.
+                  role: "system",
+                  content: `You are a lead extraction assistant.
 
-${target.isDirectory ? `THIS IS A DIRECTORY/LISTING PAGE (e.g. Justdial, Zomato, Sulekha, Tripadvisor, Yelp).
-- Return EVERY restaurant as a SEPARATE object in the businesses array.
-- If 15 restaurants are listed, return 15 objects. Do not merge or skip any.
+THE USER'S SEARCH: "${search_query}"
+
+${target.isDirectory ? `THIS IS A DIRECTORY / LISTING PAGE (e.g. Justdial, Zomato, Sulekha, Tripadvisor, Yelp).
+- Return EVERY business listed on this page as a SEPARATE object in the businesses array.
+- If 15 businesses are listed, return 15 objects. Do NOT merge or skip any.
 - Phones typically appear as "+91-XXXXXXXXXX", "098XXXXXXXX", or 10-digit strings near "Call"/"Tel"/"Ph".
-- Include restaurants that are listed on this platform but may not have their own website.
-` : `THIS IS A SINGLE RESTAURANT WEBSITE.
-- Return exactly 1 object for this restaurant.
+- Include businesses even if they only have a name and phone — partial data is fine.
+` : `THIS IS A DIRECT BUSINESS WEBSITE.
+- Return exactly 1 object for this business.
 - Extract every contact detail visible on the page.
 `}
-Rules for all extractions:
-1. phone: copy exactly as written — never reformat or shorten.
-2. address: include area/locality/city even if partial.
-3. website: the restaurant's own URL if explicitly linked; "" otherwise.
-4. email: extract if present; "" if not.
-5. NEVER invent data. Leave any missing field as "".
-6. Only skip an entry if zero restaurant name can be found.
+Rules:
+1. company_name: the business name. REQUIRED — skip any entry with no identifiable name.
+2. phone: copy exactly as written — never reformat or shorten. "" if not found.
+3. email: extract if present. "" if not.
+4. address: include area/locality/city even if partial. "" if not found.
+5. website: the business's own URL if explicitly linked; "" otherwise.
+6. description: one sentence about what the business does. "" if unknown.
+7. NEVER invent data. Leave any missing field as "".
+8. Be LENIENT — include a business even if it only has a name and one other field.
 
-Return ONLY valid JSON in this exact shape:
+Return ONLY valid JSON:
 { "businesses": [
   { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "description": "" }
 ] }
-Empty: { "businesses": [] }`,
+No businesses found: { "businesses": [] }`,
                 },
                 {
-                  role:    "user",
-                  content: content.substring(0, 8000),
+                  role: "user",
+                  content: content.substring(0, 12000),
                 },
               ],
               `extract-${target.domain}`,
@@ -391,7 +366,7 @@ Empty: { "businesses": [] }`,
             const businesses = extracted?.businesses ?? [];
             if (businesses.length === 0) return [];
 
-            console.log(`    ✅ ${target.domain}${target.isDirectory ? " [DIR]" : ""}: ${businesses.length} business(es) found`);
+            console.log(`    ✅ ${target.domain}${target.isDirectory ? " [DIR]" : ""}: ${businesses.length} business(es)`);
 
             const pageResults: { lead: object; score: number }[] = [];
 
@@ -399,21 +374,23 @@ Empty: { "businesses": [] }`,
               const name = biz.company_name?.trim();
               if (!name) continue;
 
+              // ── Name-based dedup across all sources ────────
               const norm = normaliseName(name);
-              if (seenNames.has(norm)) continue; // cross-source deduplication
+              if (seenNames.has(norm)) continue;
               seenNames.add(norm);
 
-              // Use biz.website if provided, else fall back to the source URL
-              // (only for direct sites — for directories the source URL is the listing page, not the restaurant)
+              // Use biz.website if provided, else fall back to source URL
+              // (only for direct sites — for directories the source URL
+              // is the listing page, not the individual business)
               const website = biz.website?.trim()
                 ? biz.website.trim()
                 : (target.isDirectory ? "" : target.url);
 
-              // Unique domain key per restaurant so upsert doesn't collide
+              // Unique domain key per business so upsert doesn't collide
               const slug      = norm.replace(/\s+/g, "-").substring(0, 60);
               const domainKey = target.isDirectory
-                ? `${target.domain}#${slug}`
-                : target.domain;
+                ? `${target.domain}#${slug}`   // e.g. justdial.com#corporate-dhaba
+                : target.domain;               // e.g. thecorporatedhaba.com
 
               const lead = {
                 preference_id,
@@ -423,14 +400,14 @@ Empty: { "businesses": [] }`,
                 status:    "verified",
               };
 
-              // Score — phone + email are most valuable for outreach
+              // LENIENT scoring — every field adds points, nothing is required
               const score =
-                (name                        ? 10 : 0) +
-                (biz.phone?.trim()           ? 35 : 0) +
-                (biz.email?.trim()           ? 35 : 0) +
-                (biz.address?.trim()         ? 10 : 0) +
-                (website                     ?  5 : 0) +
-                (biz.description?.trim()     ?  5 : 0);
+                (name                    ? 10 : 0) +
+                (biz.phone?.trim()       ? 30 : 0) +
+                (biz.email?.trim()       ? 30 : 0) +
+                (biz.address?.trim()     ? 10 : 0) +
+                (website                 ? 10 : 0) +
+                (biz.description?.trim() ?  5 : 0);
 
               pageResults.push({ lead, score });
             }
@@ -443,30 +420,31 @@ Empty: { "businesses": [] }`,
         }),
       );
 
-      // Flatten batch results and push (name dedup already applied above)
+      // Flatten and accumulate
       for (const item of batchResults.flat()) {
         allLeads.push(item);
       }
 
-      console.log(`  Running total: ${allLeads.length} unique leads (${elapsed()}).`);
+      console.log(`  Running total: ${allLeads.length} unique leads.`);
 
-      if (allLeads.length >= FINAL_OUTPUT_SIZE) {
-        console.log(`  🎯 Reached ${FINAL_OUTPUT_SIZE} leads — stopping early.`);
-        break outer;
+      // Stop early if we already have more than enough
+      if (allLeads.length >= FINAL_OUTPUT_SIZE * 2) {
+        console.log(`  🎯 ${allLeads.length} leads collected — stopping extraction early.`);
+        break;
       }
     }
 
-    // Sort by data completeness, take best 100
+    // Sort by score, take best 100
     allLeads.sort((a, b) => b.score - a.score);
     const finalLeads = allLeads.slice(0, FINAL_OUTPUT_SIZE).map((x) => x.lead);
 
-    console.log(`✅ [PHASE 4 RESULT] ${allLeads.length} unique leads → ${finalLeads.length} selected (${elapsed()}).`);
+    console.log(`✅ [PHASE 4] ${allLeads.length} extracted → top ${finalLeads.length} selected.`);
 
     // ══════════════════════════════════════════════════════════
     // PHASE 5 — SAVE TO DATABASE
     // ══════════════════════════════════════════════════════════
     if (finalLeads.length > 0) {
-      console.log("💾 [PHASE 5] Saving…");
+      console.log("💾 [PHASE 5] Saving leads…");
 
       const { data: inserted, error: leadsError } = await supabase
         .from("leads")
@@ -497,10 +475,10 @@ Empty: { "businesses": [] }`,
 
     await supabase
       .from("lead_preferences")
-      .update({ status: "completed" })
+      .update({ status: "completed", completed_at: new Date().toISOString() })
       .eq("id", preference_id);
 
-    console.log(`🏁 [FINISHED] Total time: ${elapsed()}`);
+    console.log("🏁 [FINISHED] Pipeline complete.");
     console.log("══════════════════════════════════════════════════════════");
 
     return new Response(
@@ -508,13 +486,20 @@ Empty: { "businesses": [] }`,
         success:         true,
         total_extracted: allLeads.length,
         leads_saved:     finalLeads.length,
-        elapsed_s:       parseFloat(elapsed()),
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
 
   } catch (error) {
     console.error("⛔ [CRITICAL]", (error as Error).message);
+
+    if (preference_id) {
+      await supabase
+        .from("lead_preferences")
+        .update({ status: "failed", error_message: (error as Error).message })
+        .eq("id", preference_id).catch(() => {});
+    }
+
     return new Response(
       JSON.stringify({ error: (error as Error).message }),
       { status: 500, headers: { "Content-Type": "application/json" } },
