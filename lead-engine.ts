@@ -11,13 +11,11 @@ const TAVILY_API_KEY     = Deno.env.get("TAVILY_API_KEY")!;
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const FINAL_OUTPUT_SIZE  = 100;
 const EXTRACT_BATCH_SIZE = 10;
-const MAX_DIR_PAGES      = 5;   // allow up to 5 URLs from the same directory domain
+const MAX_DIR_PAGES      = 5;
 const SUB_QUERY_COUNT    = 20;
 
 // ─── DOMAIN LISTS ─────────────────────────────────────────────────────────────
 
-// Directory pages list 10-30 businesses each — highest yield per extraction.
-// We WANT these and will extract EVERY business from them.
 const DIRECTORY_DOMAINS = [
   "justdial.com", "sulekha.com", "zomato.com", "swiggy.com",
   "tripadvisor.", "yelp.", "indiamart.com", "tradeindia.com",
@@ -26,7 +24,6 @@ const DIRECTORY_DOMAINS = [
   "yellowpages.", "lbb.in", "whatshot.in",
 ];
 
-// Pure noise — zero chance of real business contact data.
 const HARD_BLOCKED = [
   "facebook.com", "instagram.com", "twitter.com", "x.com",
   "linkedin.com", "youtube.com", "youtu.be", "tiktok.com",
@@ -43,6 +40,11 @@ function safeHostname(raw: string): string | null {
   catch { return null; }
 }
 
+function safeOrigin(raw: string): string | null {
+  try { return new URL(raw).origin; }
+  catch { return null; }
+}
+
 function isDirectory(domain: string): boolean {
   return DIRECTORY_DOMAINS.some((d) => domain.includes(d));
 }
@@ -51,9 +53,30 @@ function isBlocked(domain: string): boolean {
   return HARD_BLOCKED.some((b) => domain.includes(b));
 }
 
-/** Normalise a company name for dedup (lowercase, strip punctuation). */
 function normaliseName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Resolve a possibly-relative URL against a base page URL.
+ * e.g. "/Delhi/SomeBiz/..." + "https://www.justdial.com/search?q=..." → "https://www.justdial.com/Delhi/SomeBiz/..."
+ */
+function resolveUrl(href: string, pageUrl: string): string {
+  if (!href) return "";
+  // Already absolute
+  if (href.startsWith("http://") || href.startsWith("https://")) return href;
+  // Protocol-relative
+  if (href.startsWith("//")) return "https:" + href;
+  // Relative — resolve against page origin
+  const origin = safeOrigin(pageUrl);
+  if (!origin) return href;
+  if (href.startsWith("/")) return origin + href;
+  // Relative without leading slash — append to page path
+  try {
+    return new URL(href, pageUrl).href;
+  } catch {
+    return origin + "/" + href;
+  }
 }
 
 async function gptJson<T>(
@@ -81,6 +104,37 @@ async function gptJson<T>(
   }
 }
 
+/**
+ * Fetch page content via Tavily Extract.
+ * include_raw_content = true gives us the full HTML so GPT can see <a href="..."> links.
+ * We return BOTH raw_content (HTML with links) and text content.
+ */
+async function fetchPageContent(url: string): Promise<{ html: string; text: string }> {
+  try {
+    const res = await fetch("https://api.tavily.com/extract", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        urls: [url],
+      }),
+    });
+
+    if (!res.ok) return { html: "", text: "" };
+
+    const data = await res.json();
+    const result = data.results?.[0];
+    if (!result) return { html: "", text: "" };
+
+    return {
+      html: result.raw_content ?? "",
+      text: result.raw_content ?? "",
+    };
+  } catch {
+    return { html: "", text: "" };
+  }
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 serve(async (req) => {
   console.log("══════════════════════════════════════════════════════════");
@@ -104,8 +158,6 @@ serve(async (req) => {
 
     // ══════════════════════════════════════════════════════════
     // PHASE 1 — QUERY EXPANSION
-    // Mix of directory queries (high yield: 10-20 leads/page)
-    // AND direct/official-site queries (richer data per lead).
     // ══════════════════════════════════════════════════════════
     console.log("🧠 [PHASE 1] Expanding query…");
 
@@ -160,7 +212,6 @@ Search intent: "${search_query}"`,
     const rawResults: { url: string; snippet: string }[] = [];
 
     const [parallelPages, tavilyPages] = await Promise.all([
-      // 2A — Parallel Search
       Promise.all(
         subQueries.map((q) =>
           fetch("https://api.parallel.ai/v1beta/search", {
@@ -174,7 +225,6 @@ Search intent: "${search_query}"`,
           }).then((r) => r.json()).catch(() => ({ results: [] }))
         )
       ),
-      // 2B — Tavily Search
       Promise.all(
         subQueries.map((q) =>
           fetch("https://api.tavily.com/search", {
@@ -205,13 +255,6 @@ Search intent: "${search_query}"`,
 
     // ══════════════════════════════════════════════════════════
     // PHASE 3 — FILTER, DEDUP & SORT
-    //
-    // KEY LOGIC:
-    //   Directory domains → allow up to MAX_DIR_PAGES different
-    //     URLs from the same domain (each page lists different
-    //     businesses, so justdial.com/page1 ≠ justdial.com/page2).
-    //   Direct domains    → 1 URL per domain (it's one business).
-    //   Directory targets come FIRST (highest yield per GPT call).
     // ══════════════════════════════════════════════════════════
     console.log("🧹 [PHASE 3] Filtering and deduplicating…");
 
@@ -231,20 +274,17 @@ Search intent: "${search_query}"`,
       if (isBlocked(domain)) continue;
 
       if (isDirectory(domain)) {
-        // Allow multiple pages from the same directory domain
         const count = dirPageCount.get(domain) ?? 0;
         if (count >= MAX_DIR_PAGES) continue;
         dirPageCount.set(domain, count + 1);
         dirTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: true });
       } else {
-        // Direct sites: one URL per domain
         if (seenDirectDomains.has(domain)) continue;
         seenDirectDomains.add(domain);
         directTargets.push({ url: item.url, domain, snippet: item.snippet, isDirectory: false });
       }
     }
 
-    // Directory pages first (more leads per call), then direct sites
     const targets = [...dirTargets, ...directTargets];
     const dirCount = dirTargets.length;
 
@@ -253,25 +293,18 @@ Search intent: "${search_query}"`,
     // ══════════════════════════════════════════════════════════
     // PHASE 4 — EXTRACTION & SCORING
     //
-    // TWO EXTRACTION MODES:
-    //   Directory pages → GPT returns businesses[] array with
-    //     EVERY business listed on the page. A single Justdial
-    //     page can yield 10-20 leads.
-    //   Direct sites    → GPT returns a single-item businesses[]
-    //     array for that one business.
-    //
-    // DEDUP: By normalised company name across ALL sources.
-    //   Domain-based dedup would wrongly merge different
-    //   restaurants from the same directory.
-    //
-    // LENIENT CRITERIA: A lead is kept if it has a company_name.
-    //   Phone/email/address are scored but NOT required.
-    //   This maximises unique lead count.
+    // KEY CHANGES:
+    //   1. For directory pages, we now fetch full HTML content
+    //      so GPT can see <a href="..."> links for each business.
+    //   2. GPT extracts listing_url per business (the exact link
+    //      to that business on the directory page).
+    //   3. We store source_url (the page we scraped) and
+    //      listing_url (the per-business link) in lead_data.
     // ══════════════════════════════════════════════════════════
     console.log(`⛏️  [PHASE 4] Extracting ${targets.length} targets in batches of ${EXTRACT_BATCH_SIZE}…`);
 
     const allLeads: { lead: object; score: number }[] = [];
-    const seenNames = new Set<string>(); // dedup by normalised company name
+    const seenNames = new Set<string>();
 
     for (let i = 0; i < targets.length; i += EXTRACT_BATCH_SIZE) {
       const batch    = targets.slice(i, i + EXTRACT_BATCH_SIZE);
@@ -285,22 +318,16 @@ Search intent: "${search_query}"`,
             // ── 4A: Get page content ─────────────────────────
             let content = target.snippet;
 
-            // Always fetch full content for directory pages (listing
-            // data is in the full HTML, not the snippet).
-            // For direct sites, only fetch if snippet is too short.
+            // ALWAYS fetch full content for directory pages —
+            // we need the HTML links. For direct sites, only
+            // fetch if snippet is too short.
             const shouldFetch = target.isDirectory || content.length < 400;
 
             if (shouldFetch) {
-              const scrapeRes = await fetch("https://api.tavily.com/extract", {
-                method:  "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ api_key: TAVILY_API_KEY, urls: [target.url] }),
-              }).catch(() => null);
-
-              if (scrapeRes?.ok) {
-                const scrapeData = await scrapeRes.json().catch(() => ({}));
-                const extracted  = scrapeData.results?.[0]?.raw_content ?? "";
-                if (extracted.length > content.length) content = extracted;
+              const fetched = await fetchPageContent(target.url);
+              const fetchedContent = fetched.html || fetched.text;
+              if (fetchedContent.length > content.length) {
+                content = fetchedContent;
               }
             }
 
@@ -310,9 +337,6 @@ Search intent: "${search_query}"`,
             }
 
             // ── 4B: GPT extraction ───────────────────────────
-            // UNIFIED shape: always returns { businesses: [] }
-            // Directory pages → 10-20 entries
-            // Direct sites    → exactly 1 entry
             const extracted = await gptJson<{
               businesses: {
                 company_name: string;
@@ -320,6 +344,7 @@ Search intent: "${search_query}"`,
                 phone:        string;
                 email:        string;
                 website:      string;
+                listing_url:  string;
                 description:  string;
               }[];
             }>(
@@ -329,29 +354,49 @@ Search intent: "${search_query}"`,
                   content: `You are a lead extraction assistant.
 
 THE USER'S SEARCH: "${search_query}"
+SOURCE PAGE URL: "${target.url}"
 
 ${target.isDirectory ? `THIS IS A DIRECTORY / LISTING PAGE (e.g. Justdial, Zomato, Sulekha, Tripadvisor, Yelp).
 - Return EVERY business listed on this page as a SEPARATE object in the businesses array.
 - If 15 businesses are listed, return 15 objects. Do NOT merge or skip any.
 - Phones typically appear as "+91-XXXXXXXXXX", "098XXXXXXXX", or 10-digit strings near "Call"/"Tel"/"Ph".
 - Include businesses even if they only have a name and phone — partial data is fine.
+
+CRITICAL — listing_url extraction:
+- For EACH business, extract its INDIVIDUAL detail/profile page URL from the directory.
+- Look for <a href="..."> links wrapping or near each business name.
+- On Justdial: URLs look like "justdial.com/Delhi/BusinessName-Near-Area/011PXX11-XX11-..."
+- On Zomato: URLs look like "zomato.com/ncr/business-name-locality"
+- On Sulekha: URLs look like "sulekha.com/business-name-city-contact-address"
+- On Tripadvisor: URLs look like "tripadvisor.com/Restaurant_Review-..."
+- On Yelp: URLs look like "yelp.com/biz/business-name-city"
+- On Magicpin: URLs look like "magicpin.in/city/business-name/..."
+- On LBB: URLs look like "lbb.in/city/business-name/..."
+- On Swiggy: URLs look like "swiggy.com/restaurants/business-name-..."
+- If the URL is RELATIVE (starts with "/" or no "http"), prepend the directory's origin.
+- If you cannot find the individual URL, use "" — NEVER make one up.
 ` : `THIS IS A DIRECT BUSINESS WEBSITE.
 - Return exactly 1 object for this business.
 - Extract every contact detail visible on the page.
+- listing_url: "" (not applicable for direct sites).
 `}
 Rules:
 1. company_name: the business name. REQUIRED — skip any entry with no identifiable name.
 2. phone: copy exactly as written — never reformat or shorten. "" if not found.
 3. email: extract if present. "" if not.
 4. address: include area/locality/city even if partial. "" if not found.
-5. website: the business's own URL if explicitly linked; "" otherwise.
-6. description: one sentence about what the business does. "" if unknown.
-7. NEVER invent data. Leave any missing field as "".
-8. Be LENIENT — include a business even if it only has a name and one other field.
+5. website: the business's OWN official website URL (not the directory URL). "" if not found or not explicitly linked.
+6. listing_url: the EXACT URL to this specific business's page on THIS directory/listing site.
+   - For directory pages: extract from href links in the HTML. This is the clickable link to the business's detail page.
+   - For direct sites: leave as "".
+   - MUST be a real URL found in the content. NEVER fabricate or guess URLs.
+7. description: one sentence about what the business does. "" if unknown.
+8. NEVER invent data. Leave any missing field as "".
+9. Be LENIENT — include a business even if it only has a name and one other field.
 
 Return ONLY valid JSON:
 { "businesses": [
-  { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "description": "" }
+  { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "listing_url": "", "description": "" }
 ] }
 No businesses found: { "businesses": [] }`,
                 },
@@ -379,34 +424,53 @@ No businesses found: { "businesses": [] }`,
               if (seenNames.has(norm)) continue;
               seenNames.add(norm);
 
-              // Use biz.website if provided, else fall back to source URL
-              // (only for direct sites — for directories the source URL
-              // is the listing page, not the individual business)
+              // website = official business website (NOT directory)
               const website = biz.website?.trim()
                 ? biz.website.trim()
                 : (target.isDirectory ? "" : target.url);
 
-              // Unique domain key per business so upsert doesn't collide
+              // listing_url = the exact link to this business on the directory
+              // Resolve relative URLs against the source page URL
+              let listing_url = "";
+              if (target.isDirectory && biz.listing_url?.trim()) {
+                listing_url = resolveUrl(biz.listing_url.trim(), target.url);
+              }
+
+              // source_url = the page we actually scraped
+              const source_url = target.url;
+
+              // The "best link" for display: use listing_url if available,
+              // else website, else source_url
+              const best_link = listing_url || website || source_url;
+
               const slug      = norm.replace(/\s+/g, "-").substring(0, 60);
               const domainKey = target.isDirectory
-                ? `${target.domain}#${slug}`   // e.g. justdial.com#corporate-dhaba
-                : target.domain;               // e.g. thecorporatedhaba.com
+                ? `${target.domain}#${slug}`
+                : target.domain;
 
               const lead = {
                 preference_id,
                 search_query,
                 domain:    domainKey,
-                lead_data: { ...biz, company_name: name, website },
-                status:    "verified",
+                lead_data: {
+                  ...biz,
+                  company_name: name,
+                  website,
+                  listing_url,   // exact directory page link for this business
+                  source_url,    // the page we scraped this from
+                  best_link,     // most useful link to display to user
+                },
+                status: "verified",
               };
 
-              // LENIENT scoring — every field adds points, nothing is required
+              // Scoring — listing_url adds points since it's a real actionable link
               const score =
                 (name                    ? 10 : 0) +
                 (biz.phone?.trim()       ? 30 : 0) +
                 (biz.email?.trim()       ? 30 : 0) +
                 (biz.address?.trim()     ? 10 : 0) +
                 (website                 ? 10 : 0) +
+                (listing_url             ?  8 : 0) +  // bonus for having exact link
                 (biz.description?.trim() ?  5 : 0);
 
               pageResults.push({ lead, score });
@@ -420,14 +484,12 @@ No businesses found: { "businesses": [] }`,
         }),
       );
 
-      // Flatten and accumulate
       for (const item of batchResults.flat()) {
         allLeads.push(item);
       }
 
       console.log(`  Running total: ${allLeads.length} unique leads.`);
 
-      // Stop early if we already have more than enough
       if (allLeads.length >= FINAL_OUTPUT_SIZE * 2) {
         console.log(`  🎯 ${allLeads.length} leads collected — stopping extraction early.`);
         break;
