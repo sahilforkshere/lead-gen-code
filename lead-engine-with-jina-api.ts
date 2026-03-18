@@ -10,7 +10,7 @@ const TAVILY_API_KEY     = Deno.env.get("TAVILY_API_KEY")!;
 const JINA_API_KEY       = Deno.env.get("JINA_API_KEY")!;    // ← NEW
 const SERPER_API_KEY     = Deno.env.get("SERPER_API_KEY")!;  // ← NEW
 
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+// // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 // const FINAL_OUTPUT_SIZE  = 100;
 // const EXTRACT_BATCH_SIZE = 10;
 // const MAX_DIR_PAGES      = 5;
@@ -493,10 +493,27 @@ No businesses found: { "businesses": [] }`,
               const source_url = target.url;
               const best_link  = listing_url || website || source_url;
 
-              const slug      = norm.replace(/\s+/g, "-").substring(0, 60);
-              const domainKey = target.isDirectory
-                ? `${target.domain}#${slug}`
-                : target.domain;
+              const slug = norm.replace(/\s+/g, "-").substring(0, 60);
+
+              // domainKey is ONLY used for deduplication (UNIQUE constraint in DB).
+              // Priority:
+              //   1. Real business website hostname  e.g. "olivebarkitchen.com"
+              //   2. Listing URL hostname + slug     e.g. "justdial.com#olive-bar-kitchen"
+              //   3. Directory domain + slug         e.g. "justdial.com#olive-bar-kitchen" (fallback)
+              //   4. Direct target domain            e.g. "olivebarkitchen.com"
+              //
+              // This means the domain column in Supabase will show the REAL business
+              // domain when available, instead of fake slug anchors.
+              const websiteHost   = website   ? safeHostname(website)     : null;
+              const listingHost   = listing_url ? safeHostname(listing_url) : null;
+
+              const domainKey = websiteHost
+                ? websiteHost                               // best: real business domain
+                : listingHost
+                  ? `${listingHost}#${slug}`               // good: real listing URL host
+                  : target.isDirectory
+                    ? `${target.domain}#${slug}`           // fallback: dir + slug
+                    : target.domain;                       // direct site
 
               const lead = {
                 preference_id,
