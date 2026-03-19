@@ -7,19 +7,45 @@ const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENAI_API_KEY     = Deno.env.get("OPENAI_API_KEY")!;
 const PARALLEL_API_KEY   = Deno.env.get("PARALLEL_API_KEY")!;
 const TAVILY_API_KEY     = Deno.env.get("TAVILY_API_KEY")!;
-const JINA_API_KEY       = Deno.env.get("JINA_API_KEY")!;    // ← NEW
-const SERPER_API_KEY     = Deno.env.get("SERPER_API_KEY")!;  // ← NEW
+const JINA_API_KEY       = Deno.env.get("JINA_API_KEY")!;
+const SERPER_API_KEY     = Deno.env.get("SERPER_API_KEY")!;
 
-// // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-// const FINAL_OUTPUT_SIZE  = 100;
-// const EXTRACT_BATCH_SIZE = 10;
-// const MAX_DIR_PAGES      = 5;
-// const SUB_QUERY_COUNT    = 20;
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const FINAL_OUTPUT_SIZE  = 20;  // Decrease from 100 to 20
-const EXTRACT_BATCH_SIZE = 5;   // Decrease from 10 to 5
-const MAX_DIR_PAGES      = 2;   // Decrease from 5 to 2
-const SUB_QUERY_COUNT    = 4;   // Decrease from 20 to 4
+const FINAL_OUTPUT_SIZE  = 20;
+const EXTRACT_BATCH_SIZE = 5;
+const MAX_DIR_PAGES      = 2;
+const SUB_QUERY_COUNT    = 4;
+
+// ─── LEAD RANK TIERS ─────────────────────────────────────────────────────────
+// Tier 1 (best):  Has own website       → score bonus +50
+// Tier 2 (good):  Has social media page → score bonus +25
+// Tier 3 (basic): Neither               → score bonus +0
+const TIER_WEBSITE      = "tier_1_website";
+const TIER_SOCIAL_MEDIA = "tier_2_social_media";
+const TIER_NONE         = "tier_3_none";
+
+const TIER_SCORE_BONUS: Record<string, number> = {
+  [TIER_WEBSITE]:      50,
+  [TIER_SOCIAL_MEDIA]: 25,
+  [TIER_NONE]:          0,
+};
+
+// ─── SOCIAL MEDIA DOMAINS ─────────────────────────────────────────────────────
+// These are used to DETECT social media links (not to block them).
+// A lead with an instagram.com link but no website = Tier 2.
+const SOCIAL_MEDIA_DOMAINS = [
+  "facebook.com", "fb.com", "fb.me",
+  "instagram.com",
+  "twitter.com", "x.com",
+  "linkedin.com",
+  "youtube.com", "youtu.be",
+  "pinterest.com",
+  "tiktok.com",
+  "threads.net",
+  "snapchat.com",
+  "wa.me", "whatsapp.com",
+  "t.me", "telegram.me",
+];
 
 // ─── DOMAIN LISTS ─────────────────────────────────────────────────────────────
 
@@ -71,22 +97,69 @@ function resolveUrl(href: string, pageUrl: string): string {
   const origin = safeOrigin(pageUrl);
   if (!origin) return href;
   if (href.startsWith("/")) return origin + href;
-  try {
-    return new URL(href, pageUrl).href;
-  } catch {
-    return origin + "/" + href;
-  }
+  try { return new URL(href, pageUrl).href; }
+  catch { return origin + "/" + href; }
 }
 
-/** Validate that a URL is a real absolute https link, not fabricated. */
 function isValidHttpUrl(url: string): boolean {
   if (!url) return false;
   try {
     const u = new URL(url);
     return u.protocol === "https:" || u.protocol === "http:";
-  } catch {
-    return false;
+  } catch { return false; }
+}
+
+/**
+ * Check if a URL belongs to a social media platform.
+ */
+function isSocialMediaUrl(url: string): boolean {
+  if (!url) return false;
+  const host = safeHostname(url);
+  if (!host) return false;
+  return SOCIAL_MEDIA_DOMAINS.some((d) => host.includes(d));
+}
+
+/**
+ * Check if a URL is a real business website (not a directory, not social media).
+ */
+function isRealBusinessWebsite(url: string): boolean {
+  if (!url) return false;
+  if (!isValidHttpUrl(url)) return false;
+  const host = safeHostname(url);
+  if (!host) return false;
+  // Not a directory page
+  if (isDirectory(host)) return false;
+  // Not social media
+  if (isSocialMediaUrl(url)) return false;
+  // Not blocked
+  if (isBlocked(host)) return false;
+  return true;
+}
+
+/**
+ * Determine the lead's rank tier based on available online presence.
+ *
+ * Tier 1: Has a real business website (own domain, not directory/social)
+ * Tier 2: Has at least one social media page (Instagram, Facebook, etc.)
+ * Tier 3: Neither — only directory listing or phone/address
+ */
+function classifyLeadTier(
+  website: string,
+  socialMediaLinks: string[],
+): { tier: string; tierLabel: string } {
+  // Tier 1: Has a real business website
+  if (isRealBusinessWebsite(website)) {
+    return { tier: TIER_WEBSITE, tierLabel: "Has Website" };
   }
+
+  // Tier 2: Has at least one social media link
+  const validSocials = socialMediaLinks.filter((url) => url && isSocialMediaUrl(url));
+  if (validSocials.length > 0) {
+    return { tier: TIER_SOCIAL_MEDIA, tierLabel: "Has Social Media" };
+  }
+
+  // Tier 3: Neither
+  return { tier: TIER_NONE, tierLabel: "No Online Presence" };
 }
 
 async function gptJson<T>(
@@ -115,25 +188,15 @@ async function gptJson<T>(
 }
 
 // ─── JINA AI PAGE READER ──────────────────────────────────────────────────────
-/**
- * Uses Jina AI Reader (r.jina.ai) to fetch a URL and return clean Markdown
- * that PRESERVES all href links — exactly what GPT needs to extract listing_urls.
- *
- * Jina returns structured Markdown like:
- *   [Business Name](https://justdial.com/Delhi/BusinessName-/...)
- * which gives GPT real, extractable URLs instead of broken HTML fragments.
- */
 async function fetchPageWithJina(url: string): Promise<string> {
   try {
     const jinaUrl = `https://r.jina.ai/${url}`;
     const res = await fetch(jinaUrl, {
       method: "GET",
       headers: {
-        "Authorization": `Bearer ${JINA_API_KEY}`,
-        "Accept":        "text/plain",
-        // Ask Jina to return full link text in Markdown format
+        "Authorization":   `Bearer ${JINA_API_KEY}`,
+        "Accept":          "text/plain",
         "X-Return-Format": "markdown",
-        // Retain all links so GPT can see real hrefs
         "X-Retain-Images": "none",
       },
     });
@@ -143,22 +206,14 @@ async function fetchPageWithJina(url: string): Promise<string> {
       return "";
     }
 
-    const text = await res.text();
-    return text ?? "";
+    return (await res.text()) ?? "";
   } catch (e) {
     console.warn(`    Jina fetch error for ${url}:`, (e as Error).message);
     return "";
   }
 }
 
-// ─── SERPER URL SNIPER (Phase 4.5) ───────────────────────────────────────────
-/**
- * When GPT extracts a business name from a directory but can't find the exact
- * profile URL, we fire a targeted Google search via Serper.dev to find it.
- *
- * e.g. query = 'Parikrama Restaurant New Delhi site:justdial.com'
- * Returns the first organic result URL, or "" if nothing found.
- */
+// ─── SERPER URL SNIPER ────────────────────────────────────────────────────────
 async function resolveExactUrlWithSerper(
   businessName: string,
   directoryDomain: string,
@@ -166,8 +221,7 @@ async function resolveExactUrlWithSerper(
 ): Promise<string> {
   if (!businessName || !directoryDomain) return "";
 
-  // Build a pinpoint site-scoped Google query
-  const siteScope = directoryDomain.replace(/\.$/, ""); // strip trailing dot
+  const siteScope = directoryDomain.replace(/\.$/, "");
   const query     = `"${businessName}" ${location} site:${siteScope}`;
 
   try {
@@ -185,13 +239,83 @@ async function resolveExactUrlWithSerper(
     const data = await res.json();
     const firstResult = data.organic?.[0]?.link ?? "";
 
-    // Only accept a URL that actually belongs to the target directory
     if (firstResult && firstResult.includes(siteScope)) {
       return firstResult;
     }
     return "";
+  } catch { return ""; }
+}
+
+/**
+ * PHASE 4.75 — Serper lookup for business website + social media.
+ *
+ * For leads that don't already have a website or social media link,
+ * search Google to find them. This upgrades Tier 3 leads to Tier 1 or 2.
+ */
+async function resolveWebsiteAndSocials(
+  businessName: string,
+  location: string,
+): Promise<{ website: string; socialLinks: string[] }> {
+  if (!businessName) return { website: "", socialLinks: [] };
+
+  const query = `${businessName} ${location} official website`;
+
+  try {
+    const res = await fetch("https://google.serper.dev/search", {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-KEY":    SERPER_API_KEY,
+      },
+      body: JSON.stringify({ q: query, num: 8 }),
+    });
+
+    if (!res.ok) return { website: "", socialLinks: [] };
+
+    const data = await res.json();
+    const organicResults = data.organic ?? [];
+
+    let website = "";
+    const socialLinks: string[] = [];
+
+    for (const r of organicResults) {
+      const url = r.link ?? "";
+      if (!url) continue;
+      const host = safeHostname(url);
+      if (!host) continue;
+
+      // Check if it's a social media page for this business
+      if (isSocialMediaUrl(url)) {
+        socialLinks.push(url);
+        continue;
+      }
+
+      // Check if it's a real business website (not directory, not blocked)
+      if (!website && isRealBusinessWebsite(url)) {
+        website = url;
+      }
+    }
+
+    // Also check knowledge graph / sitelinks from Serper
+    const knowledgeGraph = data.knowledgeGraph;
+    if (knowledgeGraph) {
+      if (knowledgeGraph.website && !website) {
+        if (isRealBusinessWebsite(knowledgeGraph.website)) {
+          website = knowledgeGraph.website;
+        }
+      }
+      // Social profiles from knowledge graph
+      const profiles = knowledgeGraph.profiles ?? [];
+      for (const p of profiles) {
+        if (p.link && isSocialMediaUrl(p.link)) {
+          socialLinks.push(p.link);
+        }
+      }
+    }
+
+    return { website, socialLinks: [...new Set(socialLinks)] };
   } catch {
-    return "";
+    return { website: "", socialLinks: [] };
   }
 }
 
@@ -229,25 +353,18 @@ object with key "queries" containing exactly ${SUB_QUERY_COUNT} search strings.
 
 COMPOSITION (follow strictly):
 
-GROUP A — 10 queries targeting DIRECTORY / LISTING sites (highest lead yield):
+GROUP A — ${Math.ceil(SUB_QUERY_COUNT / 2)} queries targeting DIRECTORY / LISTING sites:
   Use these site names directly in queries:
   Justdial, Sulekha, Zomato, Magicpin, Tripadvisor, Yelp, Dineout, EazyDiner, Yellow Pages, LBB
   Format examples:
     "justdial [business type] [city/area] contact phone"
     "zomato [business type] [city] restaurants list"
-    "sulekha [business type] [area] [city] list with phone numbers"
-    "tripadvisor [business type] [city] reviews phone"
-  VARY the area/neighbourhood in each query to get DIFFERENT listing pages.
+  VARY the area/neighbourhood in each query.
 
-GROUP B — 10 queries targeting OFFICIAL / DIRECT business websites:
+GROUP B — ${Math.floor(SUB_QUERY_COUNT / 2)} queries targeting OFFICIAL / DIRECT business websites:
   Use specific neighbourhoods, business names if known, "official site", "contact us",
   "phone number", "email", "address".
-  Format examples:
-    "[business type] [specific neighbourhood] official website contact"
-    "best [business type] [area] phone number email"
-    "[famous business name] [city] official site"
-  VARY keywords: restaurant, eatery, dining, kitchen, café, bistro, cuisine, dhaba etc.
-  INCLUDE regional language terms if relevant.
+  VARY keywords and areas.
 
 Output ONLY the JSON object. No extra keys. No markdown.
 Search intent: "${search_query}"`,
@@ -265,7 +382,7 @@ Search intent: "${search_query}"`,
     console.log(`✨ [PHASE 1] ${subQueries.length} sub-queries generated.`);
 
     // ══════════════════════════════════════════════════════════
-    // PHASE 2 — DISCOVERY (Parallel + Tavily in parallel)
+    // PHASE 2 — DISCOVERY
     // ══════════════════════════════════════════════════════════
     console.log("🔍 [PHASE 2] Running bulk URL discovery…");
 
@@ -346,24 +463,36 @@ Search intent: "${search_query}"`,
     }
 
     const targets = [...dirTargets, ...directTargets];
-    const dirCount = dirTargets.length;
 
-    console.log(`🎯 [PHASE 3] ${targets.length} targets (${dirCount} directory pages + ${directTargets.length} direct sites).`);
+    console.log(`🎯 [PHASE 3] ${targets.length} targets (${dirTargets.length} directory + ${directTargets.length} direct).`);
 
     // ══════════════════════════════════════════════════════════
     // PHASE 4 — EXTRACTION & SCORING
     //
-    // KEY CHANGE: We now use Jina AI (r.jina.ai) to fetch page
-    // content instead of Tavily Extract. Jina returns clean
-    // Markdown that preserves [Link Text](https://...) format,
-    // giving GPT REAL extractable hrefs — eliminating fake URLs.
+    // GPT now also extracts social media links (instagram_url,
+    // facebook_url, etc.) so we can classify leads into tiers.
     // ══════════════════════════════════════════════════════════
-    console.log(`⛏️  [PHASE 4] Extracting ${targets.length} targets via Jina AI in batches of ${EXTRACT_BATCH_SIZE}…`);
+    console.log(`⛏️  [PHASE 4] Extracting via Jina AI…`);
 
-    const allLeads: { lead: object; score: number; needsSerper?: { name: string; domain: string; location: string } }[] = [];
+    interface LeadEntry {
+      lead: {
+        preference_id: string;
+        search_query:  string;
+        domain:        string;
+        lead_data:     Record<string, any>;
+        status:        string;
+      };
+      score:       number;
+      tier:        string;
+      tierLabel:   string;
+      needsSerper: { name: string; domain: string; location: string } | undefined;
+      needsEnrichment: boolean;  // true if Tier 3 — try to find website/social via Serper
+      businessName: string;
+    }
+
+    const allLeads: LeadEntry[] = [];
     const seenNames = new Set<string>();
 
-    // Extract a rough location from the search query for Serper queries
     const locationHint = search_query.replace(/without websites?/gi, "").trim();
 
     for (let i = 0; i < targets.length; i += EXTRACT_BATCH_SIZE) {
@@ -376,8 +505,6 @@ Search intent: "${search_query}"`,
         batch.map(async (target) => {
           try {
             // ── 4A: Fetch page via Jina AI ───────────────────
-            // Jina returns Markdown with [Title](url) links intact,
-            // which is exactly what GPT needs to extract real listing_urls.
             let content = "";
             const jinaMarkdown = await fetchPageWithJina(target.url);
 
@@ -385,26 +512,31 @@ Search intent: "${search_query}"`,
               content = jinaMarkdown;
               console.log(`    📄 Jina OK: ${target.domain} (${jinaMarkdown.length} chars)`);
             } else {
-              // Fallback: use the search snippet if Jina returned too little
               content = target.snippet;
-              console.warn(`    ⚠️  Jina short for ${target.domain}, using snippet fallback.`);
+              console.warn(`    ⚠️  Jina short for ${target.domain}, using snippet.`);
             }
 
             if (content.length < 80) {
-              console.warn(`    ⚠️  ${target.domain}: content too short, skipping.`);
+              console.warn(`    ⚠️  ${target.domain}: too short, skipping.`);
               return [];
             }
 
             // ── 4B: GPT extraction ───────────────────────────
+            // NOW extracts social media links alongside other fields
             const extracted = await gptJson<{
               businesses: {
-                company_name: string;
-                address:      string;
-                phone:        string;
-                email:        string;
-                website:      string;
-                listing_url:  string;
-                description:  string;
+                company_name:   string;
+                address:        string;
+                phone:          string;
+                email:          string;
+                website:        string;
+                listing_url:    string;
+                instagram_url:  string;
+                facebook_url:   string;
+                twitter_url:    string;
+                youtube_url:    string;
+                other_social_url: string;
+                description:    string;
               }[];
             }>(
               [
@@ -416,49 +548,43 @@ THE USER'S SEARCH: "${search_query}"
 SOURCE PAGE URL: "${target.url}"
 
 ${target.isDirectory ? `THIS IS A DIRECTORY / LISTING PAGE (e.g. Justdial, Zomato, Sulekha, Tripadvisor, Yelp).
-The content below is Markdown rendered by Jina AI. Links appear as [Business Name](https://exact-url).
-- Return EVERY business listed on this page as a SEPARATE object in the businesses array.
+The content below is Markdown rendered by Jina AI. Links appear as [Text](https://...).
+- Return EVERY business listed on this page as a SEPARATE object.
 - If 15 businesses are listed, return 15 objects. Do NOT merge or skip any.
-- Phones typically appear as "+91-XXXXXXXXXX", "098XXXXXXXX", or 10-digit strings near "Call"/"Tel"/"Ph".
-- Include businesses even if they only have a name and phone — partial data is fine.
+- Include businesses even if they only have a name and phone.
 
 CRITICAL — listing_url extraction:
 - For EACH business, find its INDIVIDUAL detail/profile page URL.
-- In Jina Markdown, links look like: [Parikrama Restaurant](https://www.justdial.com/Delhi/Parikrama-...)
-- The URL inside the parentheses is the real listing_url — copy it EXACTLY as written.
-- On Justdial: URLs look like "justdial.com/Delhi/BusinessName-Near-Area/011PXX..."
-- On Zomato: URLs look like "zomato.com/ncr/business-name-locality"
-- On Sulekha: URLs look like "sulekha.com/business-name-city-contact"
-- On Tripadvisor: URLs look like "tripadvisor.com/Restaurant_Review-..."
-- On Yelp: URLs look like "yelp.com/biz/business-name-city"
-- ONLY output listing_urls that you can literally see in the Markdown text.
-- If you cannot find the individual URL, leave listing_url as "" — NEVER invent or guess URLs.
+- In Jina Markdown, links look like: [Business Name](https://www.justdial.com/Delhi/Business-...)
+- Copy the URL from parentheses EXACTLY as written.
+- ONLY output listing_urls you can literally see in the content.
+- If not found, leave listing_url as "" — NEVER invent URLs.
 ` : `THIS IS A DIRECT BUSINESS WEBSITE.
 - Return exactly 1 object for this business.
 - Extract every contact detail visible on the page.
 - listing_url: "" (not applicable for direct sites).
 `}
 Rules:
-1. company_name: the business name. REQUIRED — skip any entry with no identifiable name.
-2. phone: copy exactly as written — never reformat or shorten. "" if not found.
+1. company_name: the business name. REQUIRED.
+2. phone: copy exactly as written. "" if not found.
 3. email: extract if present. "" if not.
-4. address: include area/locality/city even if partial. "" if not found.
-5. website: the business's OWN official website URL (not the directory URL). "" if not found.
-6. listing_url: ONLY real URLs you can see in the content. Leave "" if not found — do NOT fabricate.
-7. description: one sentence about what the business does. "" if unknown.
-8. NEVER invent data. Leave any missing field as "".
-9. Be LENIENT — include a business even if it only has a name and one other field.
+4. address: include area/locality/city. "" if not found.
+5. website: the business's OWN official website URL (not directory, not social media). "" if not found.
+6. listing_url: ONLY real URLs you see in the content. "" if not found.
+7. instagram_url: the business's Instagram profile URL if visible. "" if not.
+8. facebook_url: the business's Facebook page URL if visible. "" if not.
+9. twitter_url: the business's Twitter/X profile URL if visible. "" if not.
+10. youtube_url: the business's YouTube channel URL if visible. "" if not.
+11. other_social_url: any other social media URL (LinkedIn, TikTok, Pinterest, etc.). "" if not.
+12. description: one sentence about the business. "" if unknown.
+13. NEVER invent data. Leave missing fields as "".
 
 Return ONLY valid JSON:
 { "businesses": [
-  { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "listing_url": "", "description": "" }
-] }
-No businesses found: { "businesses": [] }`,
+  { "company_name": "", "address": "", "phone": "", "email": "", "website": "", "listing_url": "", "instagram_url": "", "facebook_url": "", "twitter_url": "", "youtube_url": "", "other_social_url": "", "description": "" }
+] }`,
                 },
-                {
-                  role: "user",
-                  content: content.substring(0, 12000),
-                },
+                { role: "user", content: content.substring(0, 12000) },
               ],
               `extract-${target.domain}`,
             );
@@ -468,7 +594,7 @@ No businesses found: { "businesses": [] }`,
 
             console.log(`    ✅ ${target.domain}${target.isDirectory ? " [DIR]" : ""}: ${businesses.length} business(es)`);
 
-            const pageResults: { lead: object; score: number; needsSerper?: { name: string; domain: string; location: string } }[] = [];
+            const pageResults: LeadEntry[] = [];
 
             for (const biz of businesses) {
               const name = biz.company_name?.trim();
@@ -482,69 +608,101 @@ No businesses found: { "businesses": [] }`,
                 ? biz.website.trim()
                 : (target.isDirectory ? "" : target.url);
 
-              // Resolve relative listing_url against source page
+              // Resolve listing_url
               let listing_url = "";
               if (target.isDirectory && biz.listing_url?.trim()) {
                 const resolved = resolveUrl(biz.listing_url.trim(), target.url);
-                // Only keep it if it's a real URL — not a fabricated one
                 listing_url = isValidHttpUrl(resolved) ? resolved : "";
               }
+
+              // Collect all social media URLs from extracted fields
+              const socialMediaLinks: string[] = [
+                biz.instagram_url?.trim()    ?? "",
+                biz.facebook_url?.trim()     ?? "",
+                biz.twitter_url?.trim()      ?? "",
+                biz.youtube_url?.trim()       ?? "",
+                biz.other_social_url?.trim() ?? "",
+              ].filter((url) => url && isSocialMediaUrl(url));
 
               const source_url = target.url;
               const best_link  = listing_url || website || source_url;
 
-              const slug = norm.replace(/\s+/g, "-").substring(0, 60);
+              // ── CLASSIFY TIER ───────────────────────────────
+              const { tier, tierLabel } = classifyLeadTier(website, socialMediaLinks);
+              const tierBonus = TIER_SCORE_BONUS[tier] ?? 0;
 
-              // domainKey is ONLY used for deduplication (UNIQUE constraint in DB).
-              // Priority:
-              //   1. Real business website hostname  e.g. "olivebarkitchen.com"
-              //   2. Listing URL hostname + slug     e.g. "justdial.com#olive-bar-kitchen"
-              //   3. Directory domain + slug         e.g. "justdial.com#olive-bar-kitchen" (fallback)
-              //   4. Direct target domain            e.g. "olivebarkitchen.com"
-              //
-              // This means the domain column in Supabase will show the REAL business
-              // domain when available, instead of fake slug anchors.
-              const websiteHost   = website   ? safeHostname(website)     : null;
-              const listingHost   = listing_url ? safeHostname(listing_url) : null;
+              // Domain key for dedup
+              const slug        = norm.replace(/\s+/g, "-").substring(0, 60);
+              const websiteHost = website ? safeHostname(website) : null;
+              const listingHost = listing_url ? safeHostname(listing_url) : null;
 
-              const domainKey = websiteHost
-                ? websiteHost                               // best: real business domain
+              const domainKey = websiteHost && isRealBusinessWebsite(website)
+                ? websiteHost
                 : listingHost
-                  ? `${listingHost}#${slug}`               // good: real listing URL host
+                  ? `${listingHost}#${slug}`
                   : target.isDirectory
-                    ? `${target.domain}#${slug}`           // fallback: dir + slug
-                    : target.domain;                       // direct site
+                    ? `${target.domain}#${slug}`
+                    : target.domain;
 
               const lead = {
                 preference_id,
                 search_query,
-                domain:    domainKey,
+                domain: domainKey,
                 lead_data: {
-                  ...biz,
-                  company_name: name,
+                  company_name:     name,
+                  address:          biz.address?.trim()     ?? "",
+                  phone:            biz.phone?.trim()        ?? "",
+                  email:            biz.email?.trim()        ?? "",
                   website,
                   listing_url,
                   source_url,
                   best_link,
+                  instagram_url:    biz.instagram_url?.trim()    ?? "",
+                  facebook_url:     biz.facebook_url?.trim()     ?? "",
+                  twitter_url:      biz.twitter_url?.trim()      ?? "",
+                  youtube_url:      biz.youtube_url?.trim()      ?? "",
+                  other_social_url: biz.other_social_url?.trim() ?? "",
+                  social_media_links: socialMediaLinks,
+                  tier,
+                  tier_label:       tierLabel,
+                  description:      biz.description?.trim()  ?? "",
                 },
                 status: "verified",
               };
 
-              const score =
+              // ── SCORING ─────────────────────────────────────
+              // Base score from data completeness
+              const baseScore =
                 (name                    ? 10 : 0) +
                 (biz.phone?.trim()       ? 30 : 0) +
                 (biz.email?.trim()       ? 30 : 0) +
                 (biz.address?.trim()     ? 10 : 0) +
-                (website                 ? 10 : 0) +
                 (listing_url             ?  8 : 0) +
                 (biz.description?.trim() ?  5 : 0);
 
-              // Flag leads from directories that are missing listing_url for Serper repair
+              // Tier bonus dominates ranking:
+              //   Tier 1 (website):      +50
+              //   Tier 2 (social media): +25
+              //   Tier 3 (neither):       +0
+              const score = baseScore + tierBonus;
+
+              // Flag for enrichment: Tier 3 leads might have a website
+              // or social page that GPT didn't find — Serper can discover them
+              const needsEnrichment = (tier === TIER_NONE);
+
               const needsSerper = (target.isDirectory && !listing_url)
                 ? { name, domain: target.domain, location: locationHint }
                 : undefined;
 
-              pageResults.push({ lead, score, needsSerper });
+              pageResults.push({
+                lead,
+                score,
+                tier,
+                tierLabel,
+                needsSerper,
+                needsEnrichment,
+                businessName: name,
+              });
             }
 
             return pageResults;
@@ -562,24 +720,18 @@ No businesses found: { "businesses": [] }`,
       console.log(`  Running total: ${allLeads.length} unique leads.`);
 
       if (allLeads.length >= FINAL_OUTPUT_SIZE * 2) {
-        console.log(`  🎯 ${allLeads.length} leads collected — stopping extraction early.`);
+        console.log(`  🎯 Enough leads — stopping extraction early.`);
         break;
       }
     }
 
     // ══════════════════════════════════════════════════════════
     // PHASE 4.5 — SERPER SNIPER: Resolve missing listing URLs
-    //
-    // For any directory lead where GPT couldn't find the exact
-    // profile URL (listing_url = ""), we ask Google via Serper
-    // to find the real link. This eliminates the fallback of
-    // storing a fake slug anchor as the clickable URL.
     // ══════════════════════════════════════════════════════════
     const leadsNeedingSniper = allLeads.filter((l) => l.needsSerper);
     if (leadsNeedingSniper.length > 0) {
-      console.log(`🎯 [PHASE 4.5] Serper Sniper: resolving ${leadsNeedingSniper.length} missing URLs…`);
+      console.log(`🎯 [PHASE 4.5] Serper Sniper: resolving ${leadsNeedingSniper.length} missing listing URLs…`);
 
-      // Fire all Serper lookups in parallel (they're cheap & fast)
       await Promise.all(
         leadsNeedingSniper.map(async (item) => {
           if (!item.needsSerper) return;
@@ -588,14 +740,12 @@ No businesses found: { "businesses": [] }`,
           const exactUrl = await resolveExactUrlWithSerper(name, domain, location);
 
           if (exactUrl) {
-            // Patch the lead in-place
-            const leadData = (item.lead as any).lead_data;
-            leadData.listing_url = exactUrl;
-            leadData.best_link   = exactUrl || leadData.website || leadData.source_url;
-            item.score          += 8; // Award the same bonus as having a listing_url from extraction
+            item.lead.lead_data.listing_url = exactUrl;
+            item.lead.lead_data.best_link   = exactUrl || item.lead.lead_data.website || item.lead.lead_data.source_url;
+            item.score += 8;
             console.log(`    🔫 Sniper hit: "${name}" → ${exactUrl}`);
           } else {
-            console.log(`    💨 Sniper miss: "${name}" on ${domain} — keeping source_url fallback.`);
+            console.log(`    💨 Sniper miss: "${name}" on ${domain}`);
           }
         })
       );
@@ -603,24 +753,140 @@ No businesses found: { "businesses": [] }`,
       console.log(`✅ [PHASE 4.5] Serper Sniper complete.`);
     }
 
-    // Sort by score, take best 100
-    allLeads.sort((a, b) => b.score - a.score);
+    // ══════════════════════════════════════════════════════════
+    // PHASE 4.75 — ENRICHMENT: Find website/social for Tier 3
+    //
+    // Tier 3 leads have no website and no social media.
+    // We do a Google search per business to try to discover
+    // their official site or social page, potentially upgrading
+    // them to Tier 1 or Tier 2.
+    // ══════════════════════════════════════════════════════════
+    const tier3Leads = allLeads.filter((l) => l.needsEnrichment);
+    if (tier3Leads.length > 0) {
+      console.log(`🔍 [PHASE 4.75] Enriching ${tier3Leads.length} Tier 3 leads (finding websites/socials)…`);
+
+      let upgradedToTier1 = 0;
+      let upgradedToTier2 = 0;
+
+      await Promise.all(
+        tier3Leads.map(async (item) => {
+          const { website: foundWebsite, socialLinks } = await resolveWebsiteAndSocials(
+            item.businessName,
+            locationHint,
+          );
+
+          const ld = item.lead.lead_data;
+
+          // Update website if found
+          if (foundWebsite && !isRealBusinessWebsite(ld.website)) {
+            ld.website  = foundWebsite;
+            ld.best_link = ld.listing_url || foundWebsite || ld.source_url;
+
+            // Update domain key to real website
+            const newHost = safeHostname(foundWebsite);
+            if (newHost) {
+              item.lead.domain = newHost;
+            }
+          }
+
+          // Update social media links if found
+          if (socialLinks.length > 0) {
+            // Merge with any existing (unlikely for Tier 3 but safe)
+            const existing = ld.social_media_links ?? [];
+            const merged   = [...new Set([...existing, ...socialLinks])];
+            ld.social_media_links = merged;
+
+            // Fill individual fields if empty
+            for (const url of socialLinks) {
+              if (!ld.instagram_url && url.includes("instagram.com")) ld.instagram_url = url;
+              if (!ld.facebook_url && url.includes("facebook.com"))   ld.facebook_url = url;
+              if (!ld.twitter_url && (url.includes("twitter.com") || url.includes("x.com"))) ld.twitter_url = url;
+              if (!ld.youtube_url && url.includes("youtube.com"))     ld.youtube_url = url;
+            }
+          }
+
+          // Re-classify tier after enrichment
+          const allSocials = ld.social_media_links ?? [];
+          const { tier: newTier, tierLabel: newLabel } = classifyLeadTier(ld.website, allSocials);
+
+          if (newTier !== item.tier) {
+            // Adjust score: remove old tier bonus, add new one
+            item.score -= TIER_SCORE_BONUS[item.tier] ?? 0;
+            item.score += TIER_SCORE_BONUS[newTier] ?? 0;
+
+            if (newTier === TIER_WEBSITE) upgradedToTier1++;
+            if (newTier === TIER_SOCIAL_MEDIA) upgradedToTier2++;
+
+            console.log(`    ⬆️  "${item.businessName}" upgraded: ${item.tierLabel} → ${newLabel}`);
+          }
+
+          item.tier      = newTier;
+          item.tierLabel  = newLabel;
+          ld.tier         = newTier;
+          ld.tier_label   = newLabel;
+        })
+      );
+
+      console.log(`✅ [PHASE 4.75] Enrichment complete: ${upgradedToTier1} → Tier 1, ${upgradedToTier2} → Tier 2.`);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // FINAL SORT — Tier first, then score within tier
+    //
+    // This ensures:
+    //   1. All Tier 1 (website) leads appear first
+    //   2. All Tier 2 (social media) leads appear next
+    //   3. All Tier 3 (neither) leads appear last
+    //   Within each tier, leads are sorted by data completeness.
+    // ══════════════════════════════════════════════════════════
+    allLeads.sort((a, b) => {
+      // Primary: tier ranking (tier string sorts lexically: tier_1 < tier_2 < tier_3)
+      if (a.tier !== b.tier) return a.tier.localeCompare(b.tier);
+      // Secondary: score within same tier (higher is better)
+      return b.score - a.score;
+    });
+
     const finalLeads = allLeads.slice(0, FINAL_OUTPUT_SIZE).map((x) => x.lead);
 
-    console.log(`✅ [PHASE 4] ${allLeads.length} extracted → top ${finalLeads.length} selected.`);
+    // Log tier breakdown
+    const tier1Count = allLeads.filter((l) => l.tier === TIER_WEBSITE).length;
+    const tier2Count = allLeads.filter((l) => l.tier === TIER_SOCIAL_MEDIA).length;
+    const tier3Count = allLeads.filter((l) => l.tier === TIER_NONE).length;
+
+    console.log(`📊 [RANKING] Tier breakdown:`);
+    console.log(`   🥇 Tier 1 (Has Website):      ${tier1Count}`);
+    console.log(`   🥈 Tier 2 (Has Social Media):  ${tier2Count}`);
+    console.log(`   🥉 Tier 3 (Neither):           ${tier3Count}`);
+    console.log(`✅ [FINAL] ${allLeads.length} extracted → top ${finalLeads.length} selected.`);
 
     // ══════════════════════════════════════════════════════════
     // PHASE 5 — SAVE TO DATABASE
     // ══════════════════════════════════════════════════════════
-    if (finalLeads.length > 0) {
-      console.log("💾 [PHASE 5] Saving leads…");
+    // ══════════════════════════════════════════════════════════
+// PHASE 5 — SAVE TO DATABASE
+// ══════════════════════════════════════════════════════════
+if (finalLeads.length > 0) {
+  console.log("💾 [PHASE 5] Saving leads…");
 
-      const { data: inserted, error: leadsError } = await supabase
-        .from("leads")
-        .upsert(finalLeads, { onConflict: "domain" })
-        .select("id");
+  // Deduplicate by domain — keep the first (highest-scored) lead per domain key
+  const domainSeen = new Set<string>();
+  const dedupedLeads = finalLeads.filter((lead: any) => {
+    const key = lead.domain;
+    if (domainSeen.has(key)) return false;
+    domainSeen.add(key);
+    return true;
+  });
 
-      if (leadsError) console.error("  Leads upsert error:", leadsError.message);
+  console.log(`  ${finalLeads.length} leads → ${dedupedLeads.length} after domain dedup.`);
+
+  const { data: inserted, error: leadsError } = await supabase
+    .from("leads")
+    .upsert(dedupedLeads, { onConflict: "domain" })
+    .select("id");
+
+  if (leadsError) console.error("  Leads upsert error:", leadsError.message);
+
+  // ... rest of junction insert stays the same
 
       if (inserted && inserted.length > 0) {
         const junction = inserted.map((l: { id: string }) => ({
@@ -655,6 +921,11 @@ No businesses found: { "businesses": [] }`,
         success:         true,
         total_extracted: allLeads.length,
         leads_saved:     finalLeads.length,
+        tier_breakdown: {
+          tier_1_website:      tier1Count,
+          tier_2_social_media: tier2Count,
+          tier_3_none:         tier3Count,
+        },
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
